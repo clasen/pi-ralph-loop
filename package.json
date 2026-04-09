@@ -1,0 +1,32 @@
+{
+  "name": "@lnilluv/pi-ralph-loop",
+  "version": "0.0.1",
+  "description": "Pi-native ralph loop — autonomous coding iterations with mid-turn supervision",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lnilluv/pi-ralph-loop.git"
+  },
+  "dependencies": {
+    "yaml": "2.7.1",
+    "minimatch": "10.0.1"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "keywords": [
+    "pi-extension",
+    "ralph",
+    "autonomous",
+    "loop"
+  ],
+  "license": "MIT"
+}
