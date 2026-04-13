@@ -43,6 +43,7 @@ commands:
 max_iterations: 25
 timeout: 300
 completion_promise: "DONE"
+rollback_on_regression: true
 guardrails:
   block_commands:
     - "rm\\s+-rf\\s+/"
@@ -74,6 +75,7 @@ Apply the smallest safe fix and explain why it works.
 | `max_iterations` | number | `50` | Stop after N iterations |
 | `timeout` | number | `300` | Per-iteration timeout in seconds; stops the loop if the agent is stuck |
 | `completion_promise` | string | — | Agent signals completion by sending `<promise>DONE</promise>`; loop breaks on match |
+| `rollback_on_regression` | boolean | `false` | Auto-revert working tree via `git stash` when metrics regress between iterations |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns to block in bash |
 | `guardrails.protected_files` | string[] | `[]` | Glob patterns to block writes |
 
@@ -114,6 +116,12 @@ When `completion_promise` is set (e.g., `"DONE"`), the loop scans the agent's me
 
 Each iteration has a configurable timeout (default 300 seconds). If the agent is stuck and doesn't become idle within the timeout, the loop stops with a warning. This prevents runaway iterations from running forever.
 
+### Automatic rollback on regression
+
+When `rollback_on_regression: true` is set, the extension creates a `git stash` snapshot before each iteration (starting from iteration 2). After the agent finishes, metrics are compared to the previous iteration. If a regression is detected (more test failures, fewer tests passing, or more lint errors), the working tree is automatically reverted to the pre-iteration state and the stash is consumed. The next iteration's system prompt explicitly tells the agent that the changes were rolled back and why, so it can try a different approach instead of building on broken code.
+
+Requirements: the project must be inside a git repository. If git is unavailable or the stash operation fails, the loop continues normally with a warning — it never breaks the loop.
+
 ### Input validation
 
 The extension validates `RALPH.md` frontmatter before starting and on each re-parse: `max_iterations` must be a positive integer, `timeout` must be positive, `block_commands` regexes must compile, and commands must have non-empty names and run strings with positive timeouts.
@@ -132,6 +140,7 @@ The extension validates `RALPH.md` frontmatter before starting and on each re-pa
 | Iteration timeout | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Session-scoped hooks | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Input validation | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Auto-rollback on regression | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Setup required | RALPH.md | config | RALPH.md | PRD pipeline | RALPH.md |
 
 ## License
