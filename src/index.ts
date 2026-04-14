@@ -1,20 +1,25 @@
 import { parse as parseYaml } from "yaml";
 import { minimatch } from "minimatch";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join, dirname, basename } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-type CommandDef = { name: string; run: string; timeout: number };
+type CommandDef = { name: string; run: string; timeout: number; maxOutput?: number; signalPatterns?: Record<string, string[]> };
+type DoneCriterion = { name: string; command: string; pattern: string };
 type Frontmatter = {
   commands: CommandDef[];
   maxIterations: number;
+  minIterations: number;
   timeout: number;
   completionPromise?: string;
   rollbackOnRegression: boolean;
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
+  doneCriteria?: DoneCriterion[];
+  greenStreakLimit: number;
+  parallel: boolean;
 };
 type ParsedRalph = { frontmatter: Frontmatter; body: string };
-type CommandOutput = { name: string; output: string };
+type CommandOutput = { name: string; output: string; exitCode?: number };
 type CommandSummaryStatus = "ok" | "failed" | "timed_out" | "error";
 type CommandSignals = { testFailures?: number; testPassed?: number; lintErrors?: number; lintWarnings?: number };
 type IterationCommandSummary = { name: string; status: CommandSummaryStatus; excerpt: string; signals: CommandSignals };
@@ -28,12 +33,15 @@ type IterationSummary = {
   regressed?: boolean;
   rolledBack?: boolean;
   rollbackDetails?: string;
+  hadChanges?: boolean;
+  diffFingerprint?: string;
 };
 type LoopState = {
   active: boolean;
   ralphPath: string;
   iteration: number;
   maxIterations: number;
+  minIterations: number;
   timeout: number;
   completionPromise?: string;
   rollbackOnRegression: boolean;
@@ -41,19 +49,23 @@ type LoopState = {
   iterationSummaries: IterationSummary[];
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
   loopSessionFile?: string;
+  diffFingerprints: string[];
+  specContent?: string;
 };
 type PersistedLoopState = {
   active: boolean;
   sessionFile?: string;
   iteration?: number;
   maxIterations?: number;
+  minIterations?: number;
   iterationSummaries?: IterationSummary[];
   guardrails?: { blockCommands: string[]; protectedFiles: string[] };
   stopRequested?: boolean;
+  specContent?: string;
 };
 
 function defaultFrontmatter(): Frontmatter {
-  return { commands: [], maxIterations: 50, timeout: 300, rollbackOnRegression: false, guardrails: { blockCommands: [], protectedFiles: [] } };
+  return { commands: [], maxIterations: 50, minIterations: 1, timeout: 300, rollbackOnRegression: false, guardrails: { blockCommands: [], protectedFiles: [] }, greenStreakLimit: 0, parallel: false };
 }
 
 function parseRalphMd(filePath: string): ParsedRalph {
@@ -64,14 +76,34 @@ function parseRalphMd(filePath: string): ParsedRalph {
 
   const yaml = (parseYaml(match[1]) ?? {}) as Record<string, any>;
   const commands: CommandDef[] = Array.isArray(yaml.commands)
-    ? yaml.commands.map((c: Record<string, any>) => ({ name: String(c.name ?? ""), run: String(c.run ?? ""), timeout: Number(c.timeout ?? 60) }))
+    ? yaml.commands.map((c: Record<string, any>) => {
+        const sp = c.signal_patterns as Record<string, unknown> | undefined;
+        const signalPatterns: Record<string, string[]> | undefined = sp && typeof sp === "object"
+          ? Object.fromEntries(Object.entries(sp).map(([k, v]) => [k, Array.isArray(v) ? v.map(String) : []]))
+          : undefined;
+        return {
+          name: String(c.name ?? ""),
+          run: String(c.run ?? ""),
+          timeout: Number(c.timeout ?? 60),
+          maxOutput: typeof c.max_output === "number" ? c.max_output : undefined,
+          signalPatterns,
+        };
+      })
     : [];
   const guardrails = (yaml.guardrails ?? {}) as Record<string, any>;
+  const doneCriteria: DoneCriterion[] | undefined = Array.isArray(yaml.done_criteria)
+    ? yaml.done_criteria.map((d: Record<string, any>) => ({
+        name: String(d.name ?? ""),
+        command: String(d.command ?? ""),
+        pattern: String(d.pattern ?? ""),
+      }))
+    : undefined;
 
   return {
     frontmatter: {
       commands,
       maxIterations: Number(yaml.max_iterations ?? 50),
+      minIterations: Number(yaml.min_iterations ?? 1),
       timeout: Number(yaml.timeout ?? 300),
       completionPromise:
         typeof yaml.completion_promise === "string" && yaml.completion_promise.trim() ? yaml.completion_promise : undefined,
@@ -80,6 +112,9 @@ function parseRalphMd(filePath: string): ParsedRalph {
         blockCommands: Array.isArray(guardrails.block_commands) ? guardrails.block_commands.map((p: unknown) => String(p)) : [],
         protectedFiles: Array.isArray(guardrails.protected_files) ? guardrails.protected_files.map((p: unknown) => String(p)) : [],
       },
+      doneCriteria,
+      greenStreakLimit: Number(yaml.green_streak_limit ?? 0),
+      parallel: yaml.parallel === true,
     },
     body: match[2] ?? "",
   };
@@ -117,25 +152,188 @@ function validateFrontmatter(fm: Frontmatter, ctx: any): boolean {
   return true;
 }
 
-function resolveRalphPath(args: string, cwd: string): string {
+function resolveRalphPath(args: string, cwd: string): string | null {
   const target = args.trim() || ".";
   const abs = resolve(cwd, target);
   if (existsSync(abs) && abs.endsWith(".md")) return abs;
   if (existsSync(join(abs, "RALPH.md"))) return join(abs, "RALPH.md");
-  throw new Error(`No RALPH.md found at ${abs}`);
+  return null;
 }
 
-function resolvePlaceholders(body: string, outputs: CommandOutput[], ralph: { iteration: number; name: string }): string {
+type ProjectDiscovery = {
+  projectName: string;
+  specFile?: string;
+  readmeFile?: string;
+  commands: CommandDef[];
+  doneCriteria: DoneCriterion[];
+  ecosystem: "node" | "rust" | "python" | "make" | "unknown";
+};
+
+const SPEC_CANDIDATES = ["specs.md", "SPECS.md", "spec.md", "SPEC.md", "TASK.md", "TODO.md", "task.md"];
+const README_CANDIDATES = ["README.md", "readme.md", "Readme.md", "README.rst", "README.txt"];
+
+const MAX_SPEC_INJECT = 6000;
+
+function readSpecContent(cwd: string): string | undefined {
+  let files: string[];
+  try { files = readdirSync(cwd); } catch { return undefined; }
+  const specName = SPEC_CANDIDATES.find((f) => files.includes(f));
+  const target = specName ?? README_CANDIDATES.find((f) => files.includes(f));
+  if (!target) return undefined;
+  try {
+    const raw = readFileSync(join(cwd, target), "utf8").trim();
+    if (!raw) return undefined;
+    if (raw.length <= MAX_SPEC_INJECT) return raw;
+    return raw.slice(0, MAX_SPEC_INJECT) + `\n\n[… truncated, read \`${target}\` for the full spec]`;
+  } catch { return undefined; }
+}
+
+function discoverProject(cwd: string): ProjectDiscovery | null {
+  const projectName = basename(cwd);
+  let files: string[];
+  try { files = readdirSync(cwd); } catch { return null; }
+  const has = (name: string) => files.includes(name);
+
+  const specFile = SPEC_CANDIDATES.find((f) => has(f));
+  const readmeFile = README_CANDIDATES.find((f) => has(f));
+
+  const commands: CommandDef[] = [];
+  const doneCriteria: DoneCriterion[] = [];
+  let ecosystem: ProjectDiscovery["ecosystem"] = "unknown";
+
+  if (has("package.json")) {
+    ecosystem = "node";
+    try {
+      const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8"));
+      const scripts = (pkg.scripts ?? {}) as Record<string, string>;
+      const seen = new Set<string>();
+
+      if (scripts.test && !seen.has(scripts.test)) {
+        seen.add(scripts.test);
+        commands.push({ name: "tests", run: "npm test", timeout: 120, maxOutput: 4000 });
+        doneCriteria.push({ name: "tests_green", command: "tests", pattern: "# fail 0|0 failed|0 failing" });
+      }
+      if (scripts.lint && !seen.has(scripts.lint)) {
+        seen.add(scripts.lint);
+        commands.push({ name: "lint", run: "npm run lint", timeout: 60, maxOutput: 2000 });
+      }
+      if (scripts.benchmark && !seen.has(scripts.benchmark)) {
+        seen.add(scripts.benchmark);
+        commands.push({ name: "benchmark", run: "npm run benchmark", timeout: 600, maxOutput: 6000 });
+      } else if (scripts.bench && !seen.has(scripts.bench)) {
+        seen.add(scripts.bench);
+        commands.push({ name: "benchmark", run: "npm run bench", timeout: 600, maxOutput: 6000 });
+      }
+    } catch { /* malformed package.json, still continue */ }
+  } else if (has("Cargo.toml")) {
+    ecosystem = "rust";
+    commands.push({ name: "tests", run: "cargo test", timeout: 300, maxOutput: 4000 });
+    commands.push({ name: "lint", run: "cargo clippy -- -D warnings", timeout: 120, maxOutput: 2000 });
+    doneCriteria.push({ name: "tests_green", command: "tests", pattern: "test result: ok" });
+  } else if (has("pyproject.toml") || has("setup.py") || has("requirements.txt")) {
+    ecosystem = "python";
+    if (has("pyproject.toml")) {
+      try {
+        const toml = readFileSync(join(cwd, "pyproject.toml"), "utf8");
+        if (toml.includes("pytest")) {
+          commands.push({ name: "tests", run: "pytest", timeout: 300, maxOutput: 4000 });
+        }
+        if (toml.includes("ruff")) {
+          commands.push({ name: "lint", run: "ruff check .", timeout: 60, maxOutput: 2000 });
+        }
+      } catch { /* continue */ }
+    }
+    if (commands.length === 0) {
+      commands.push({ name: "tests", run: "pytest", timeout: 300, maxOutput: 4000 });
+    }
+    doneCriteria.push({ name: "tests_green", command: "tests", pattern: "passed|0 failed" });
+  } else if (has("Makefile") || has("makefile")) {
+    ecosystem = "make";
+    commands.push({ name: "tests", run: "make test", timeout: 300, maxOutput: 4000 });
+    commands.push({ name: "lint", run: "make lint", timeout: 60, maxOutput: 2000 });
+  }
+
+  if (!specFile && !readmeFile && commands.length === 0) return null;
+
+  return { projectName, specFile, readmeFile, commands, doneCriteria, ecosystem };
+}
+
+
+function generateDefaultRalph(discovery: ProjectDiscovery): ParsedRalph {
+  const { specFile, readmeFile, commands, doneCriteria } = discovery;
+
+  const frontmatter: Frontmatter = {
+    commands,
+    maxIterations: 25,
+    minIterations: 3,
+    timeout: 300,
+    rollbackOnRegression: true,
+    guardrails: {
+      blockCommands: [],
+      protectedFiles: specFile ? [specFile] : [],
+    },
+    doneCriteria: doneCriteria.length ? doneCriteria : undefined,
+    greenStreakLimit: 10,
+    parallel: commands.length > 1,
+  };
+
+  const sections: string[] = [];
+  sections.push("# Autonomous Implementation Loop\n");
+
+  const docRef = specFile ?? readmeFile;
+  if (docRef) {
+    sections.push(`You are implementing this project per \`${docRef}\`. Read it carefully for requirements and design constraints.\n`);
+  } else {
+    sections.push("Analyze the existing codebase to understand the project structure, then work on improving it.\n");
+  }
+
+  if (commands.length > 0) {
+    sections.push("## Feedback\n");
+    for (const cmd of commands) {
+      const label = cmd.name.charAt(0).toUpperCase() + cmd.name.slice(1);
+      sections.push(`### ${label}\n\n{{ commands.${cmd.name} }}\n`);
+    }
+  }
+
+  sections.push("## Recent Changes\n\n{{ git.log }}\n");
+
+  sections.push(`## Iteration {{ ralph.iteration }}
+
+Each iteration:
+
+1. Review the feedback above (tests, lint, benchmarks)
+2. Identify the highest-priority failure or gap
+3. Batch related changes together -- do not make one micro-fix per iteration
+4. Verify all checks pass before committing
+5. Commit with a descriptive message
+
+### Priority order
+
+1. Failing tests or broken functionality
+2. Missing requirements from the spec${specFile ? ` (\`${specFile}\`)` : ""}
+3. Performance and correctness verification
+4. Edge cases and hardening
+
+Focus on correctness and spec compliance over micro-optimizations.`);
+
+  return { frontmatter, body: sections.join("\n") };
+}
+
+function resolvePlaceholders(body: string, outputs: CommandOutput[], ralph: { iteration: number; name: string }, gitContext?: { diff: string; log: string }): string {
   const map = new Map(outputs.map((o) => [o.name, o.output]));
   return body
     .replace(/\{\{\s*commands\.(\w[\w-]*)\s*\}\}/g, (_, name) => map.get(name) ?? "")
     .replace(/\{\{\s*ralph\.iteration\s*\}\}/g, String(ralph.iteration))
-    .replace(/\{\{\s*ralph\.name\s*\}\}/g, ralph.name);
+    .replace(/\{\{\s*ralph\.name\s*\}\}/g, ralph.name)
+    .replace(/\{\{\s*git\.diff\s*\}\}/g, gitContext?.diff ?? "")
+    .replace(/\{\{\s*git\.log\s*\}\}/g, gitContext?.log ?? "");
 }
 
 const MAX_ASSISTANT_RECAP = 800;
 const MAX_COMMAND_EXCERPT = 220;
 const MAX_CONTEXT_ITERATIONS = 5;
+const MAX_PERSIST_SUMMARIES = 10;
+const STALL_THRESHOLD = 3;
 
 function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -168,31 +366,73 @@ function extractCount(output: string, patterns: RegExp[]): number | undefined {
   return latest;
 }
 
-function extractCommandSignals(output: string): CommandSignals {
+const DEFAULT_SIGNAL_PATTERNS: Record<string, RegExp[]> = {
+  testFailures: [
+    /\b(\d+)\s+failed\b/gi,
+    /\bfailures?:\s*(\d+)\b/gi,
+    /# fail\s+(\d+)/gi,                    // Node.js test runner / TAP
+    /Tests:\s+(\d+)\s+failed/gi,           // Jest
+    /(\d+)\s+failing\b/gi,                 // Mocha
+  ],
+  testPassed: [
+    /\b(\d+)\s+passed\b/gi,
+    /\bpasses?:\s*(\d+)\b/gi,
+    /# pass\s+(\d+)/gi,                    // Node.js test runner / TAP
+    /Tests:\s+(\d+)\s+passed/gi,           // Jest
+    /(\d+)\s+passing\b/gi,                 // Mocha
+  ],
+  lintErrors: [
+    /(\d+)\s+problems?\b/gi,              // ESLint "N problems" (general, matched first)
+    /\b(\d+)\s+errors?\b/gi,
+    /\berrors?:\s*(\d+)\b/gi,
+  ],
+  lintWarnings: [
+    /\b(\d+)\s+warnings?\b/gi,
+    /\bwarnings?:\s*(\d+)\b/gi,
+  ],
+};
+
+function buildSignalPatterns(custom?: Record<string, string[]>): Record<string, RegExp[]> {
+  if (!custom) return DEFAULT_SIGNAL_PATTERNS;
+  const merged = { ...DEFAULT_SIGNAL_PATTERNS };
+  for (const [key, patterns] of Object.entries(custom)) {
+    if (key in merged) {
+      const compiled = patterns.map((p) => { try { return new RegExp(p, "gi"); } catch { return null; } }).filter((r): r is RegExp => r !== null);
+      if (compiled.length) merged[key as keyof typeof merged] = compiled;
+    }
+  }
+  return merged;
+}
+
+function extractCommandSignals(output: string, customPatterns?: Record<string, string[]>): CommandSignals {
+  const patterns = buildSignalPatterns(customPatterns);
   return {
-    testFailures: extractCount(output, [/\b(\d+)\s+failed\b/gi, /\bfailures?:\s*(\d+)\b/gi]),
-    testPassed: extractCount(output, [/\b(\d+)\s+passed\b/gi, /\bpasses?:\s*(\d+)\b/gi]),
-    lintErrors: extractCount(output, [/\b(\d+)\s+errors?\b/gi]),
-    lintWarnings: extractCount(output, [/\b(\d+)\s+warnings?\b/gi]),
+    testFailures: extractCount(output, patterns.testFailures),
+    testPassed: extractCount(output, patterns.testPassed),
+    lintErrors: extractCount(output, patterns.lintErrors),
+    lintWarnings: extractCount(output, patterns.lintWarnings),
   };
 }
 
-function summarizeCommandOutput(output: CommandOutput): IterationCommandSummary {
+function summarizeCommandOutput(output: CommandOutput, cmdDef?: CommandDef): IterationCommandSummary {
   const trimmed = output.output.trim();
   const lines = trimmed.split("\n").map((line) => line.trim()).filter(Boolean);
   const excerpt = truncateText(normalizeWhitespace(lines.slice(Math.max(0, lines.length - 6)).join(" ")), MAX_COMMAND_EXCERPT);
+  const signals = extractCommandSignals(trimmed, cmdDef?.signalPatterns);
 
   let status: CommandSummaryStatus = "ok";
-  if (/^\[timed out after \d+s\]$/i.test(trimmed)) status = "timed_out";
-  else if (/^\[error:/i.test(trimmed)) status = "error";
-  else if (/\bFAIL(?:ED)?\b|\bERROR\b|error:|failed/i.test(trimmed)) status = "failed";
+  if (/^\[timed out after \d+s\]$/i.test(trimmed)) {
+    status = "timed_out";
+  } else if (/^\[error:/i.test(trimmed)) {
+    status = "error";
+  } else if (output.exitCode !== undefined && output.exitCode !== 0) {
+    status = "failed";
+  } else {
+    const sanitized = trimmed.replace(/\b(fail(?:ed|ures?|s)?)\s*[:=]?\s*0\b/gi, "___ZERO___");
+    if (/\bFAIL(?:ED)?\b|\bERROR\b|error:|failed/i.test(sanitized)) status = "failed";
+  }
 
-  return {
-    name: output.name,
-    status,
-    excerpt,
-    signals: extractCommandSignals(trimmed),
-  };
+  return { name: output.name, status, excerpt, signals };
 }
 
 function aggregateSignals(commandSummaries: IterationCommandSummary[]): IterationSignals {
@@ -274,6 +514,8 @@ function normalizeIterationSummary(summary: any): IterationSummary {
     regressed: typeof summary.regressed === "boolean" ? summary.regressed : false,
     rolledBack: typeof summary.rolledBack === "boolean" ? summary.rolledBack : false,
     rollbackDetails: typeof summary.rollbackDetails === "string" ? summary.rollbackDetails : undefined,
+    hadChanges: typeof summary.hadChanges === "boolean" ? summary.hadChanges : undefined,
+    diffFingerprint: typeof summary.diffFingerprint === "string" ? summary.diffFingerprint : undefined,
   };
 
   if (!normalized.commandSummaries.length && !summary.signals) {
@@ -315,7 +557,8 @@ function buildIterationContext(summaries: IterationSummary[]): string {
       const rollbackNote = summary.rolledBack
         ? `\n  - rollback: changes reverted automatically (${summary.rollbackDetails ?? "regression detected"})`
         : "";
-      return `- Iteration ${summary.iteration} (${summary.duration}s)${regressionLabel}\n  - recap: ${recap}\n  - ${aggregateLine}\n  - commands: ${commandLine}${rollbackNote}`;
+      const changesNote = summary.hadChanges === false ? " [no file changes]" : "";
+      return `- Iteration ${summary.iteration} (${summary.duration}s)${regressionLabel}${changesNote}\n  - recap: ${recap}\n  - ${aggregateLine}\n  - commands: ${commandLine}${rollbackNote}`;
     })
     .join("\n");
 }
@@ -424,24 +667,72 @@ async function dropSnapshot(pi: ExtensionAPI, iteration: number): Promise<void> 
   if (idx >= 0) await gitExec(pi, `stash drop stash@{${idx}}`);
 }
 
-async function runCommands(commands: CommandDef[], pi: ExtensionAPI): Promise<CommandOutput[]> {
-  const results: CommandOutput[] = [];
-  for (const cmd of commands) {
+async function getWorkingTreeFingerprint(pi: ExtensionAPI): Promise<string> {
+  const head = await gitExec(pi, "rev-parse HEAD");
+  const status = await gitExec(pi, "status --porcelain");
+  return `${head.ok ? head.output.trim() : ""}|${status.ok ? status.output.trim() : ""}`;
+}
+
+async function getDiffFingerprint(pi: ExtensionAPI): Promise<string> {
+  const diff = await gitExec(pi, "diff HEAD~1 --stat");
+  if (!diff.ok || !diff.output.trim()) return "";
+  let hash = 0;
+  for (let j = 0; j < diff.output.length; j++) {
+    hash = ((hash << 5) - hash + diff.output.charCodeAt(j)) | 0;
+  }
+  return hash.toString(36);
+}
+
+function checkDoneCriteria(criteria: DoneCriterion[], outputs: CommandOutput[]): { allMet: boolean; unmet: string[] } {
+  const outputMap = new Map(outputs.map((o) => [o.name, o.output]));
+  const unmet: string[] = [];
+  for (const c of criteria) {
+    const text = outputMap.get(c.command);
+    if (!text) { unmet.push(`${c.name}: command '${c.command}' not found`); continue; }
     try {
-      const result = await pi.exec("bash", ["-c", cmd.run], { timeout: cmd.timeout * 1000 });
-      results.push(result.killed
-        ? { name: cmd.name, output: `[timed out after ${cmd.timeout}s]` }
-        : { name: cmd.name, output: (result.stdout + result.stderr).trim() });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      results.push({ name: cmd.name, output: `[error: ${message}]` });
+      if (!new RegExp(c.pattern).test(text)) unmet.push(c.name);
+    } catch {
+      unmet.push(`${c.name}: invalid pattern`);
     }
   }
+  return { allMet: unmet.length === 0, unmet };
+}
+
+function truncateOutput(raw: string, maxOutput?: number): string {
+  if (!maxOutput || raw.length <= maxOutput) return raw;
+  const lines = raw.split("\n");
+  const tailBudget = Math.floor(maxOutput * 0.7);
+  const headBudget = maxOutput - tailBudget - 40;
+  const tail = lines.slice(-Math.ceil(lines.length * 0.5)).join("\n");
+  const head = lines.slice(0, Math.ceil(lines.length * 0.2)).join("\n");
+  const trimmedTail = tail.length > tailBudget ? tail.slice(-tailBudget) : tail;
+  const trimmedHead = head.length > headBudget ? head.slice(0, headBudget) : head;
+  return `${trimmedHead}\n\n[… truncated ${raw.length - trimmedHead.length - trimmedTail.length} chars …]\n\n${trimmedTail}`;
+}
+
+async function runCommands(commands: CommandDef[], pi: ExtensionAPI, parallel = false): Promise<CommandOutput[]> {
+  const execute = async (cmd: CommandDef): Promise<CommandOutput> => {
+    try {
+      const result = await pi.exec("bash", ["-c", cmd.run], { timeout: cmd.timeout * 1000 });
+      if (result.killed) return { name: cmd.name, output: `[timed out after ${cmd.timeout}s]` };
+      const raw = (result.stdout + result.stderr).trim();
+      return { name: cmd.name, output: truncateOutput(raw, cmd.maxOutput), exitCode: result.exitCode ?? undefined };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { name: cmd.name, output: `[error: ${message}]` };
+    }
+  };
+
+  if (parallel) {
+    return Promise.all(commands.map(execute));
+  }
+  const results: CommandOutput[] = [];
+  for (const cmd of commands) results.push(await execute(cmd));
   return results;
 }
 
 function defaultLoopState(): LoopState {
-  return { active: false, ralphPath: "", iteration: 0, maxIterations: 50, timeout: 300, completionPromise: undefined, rollbackOnRegression: false, stopRequested: false, iterationSummaries: [], guardrails: { blockCommands: [], protectedFiles: [] }, loopSessionFile: undefined };
+  return { active: false, ralphPath: "", iteration: 0, maxIterations: 50, minIterations: 1, timeout: 300, completionPromise: undefined, rollbackOnRegression: false, stopRequested: false, iterationSummaries: [], guardrails: { blockCommands: [], protectedFiles: [] }, loopSessionFile: undefined, diffFingerprints: [] };
 }
 
 function readPersistedLoopState(ctx: any): PersistedLoopState | undefined {
@@ -498,28 +789,47 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     if (!isLoopSession(ctx)) return;
     const persisted = readPersistedLoopState(ctx);
+
+    let contextBlock = "";
+
+    const spec = persisted?.specContent ?? loopState.specContent;
+    if (spec) {
+      contextBlock += `\n\n## Project Specification (authoritative)\nThe following is the project specification. All design decisions, language choices, and success criteria come from this document. Follow it strictly.\n\n${spec}`;
+    }
+
     const summaries = (persisted?.iterationSummaries ?? []).map(normalizeIterationSummary).filter((s) => s.iteration > 0);
-    if (summaries.length === 0) return;
-    const history = buildIterationContext(summaries);
-    const trendLine = buildTrendLine(summaries);
-    const regression = detectRegression(summaries);
+    if (summaries.length > 0) {
+      const history = buildIterationContext(summaries);
+      const trendLine = buildTrendLine(summaries);
+      const regression = detectRegression(summaries);
 
-    let contextBlock = `\n\n## Ralph Loop Context\nIteration ${persisted?.iteration ?? 0}/${persisted?.maxIterations ?? 0}\n\nPrevious iteration recap:\n${history}`;
+      contextBlock += `\n\n## Ralph Loop Context\nIteration ${persisted?.iteration ?? 0}/${persisted?.maxIterations ?? 0}\n\nPrevious iteration recap:\n${history}`;
 
-    if (trendLine) {
-      contextBlock += `\n\nProgress trend:\n${trendLine}`;
+      if (trendLine) {
+        contextBlock += `\n\nProgress trend:\n${trendLine}`;
+      }
+
+      const lastSummary = summaries[summaries.length - 1];
+      if (lastSummary?.rolledBack) {
+        contextBlock += `\n\n⚠️ AUTOMATIC ROLLBACK: The previous iteration's changes were automatically reverted because of regression (${lastSummary.rollbackDetails ?? regression.details.join("; ")}). The working tree is back to the state BEFORE that iteration. Try a fundamentally different approach.`;
+      } else if (regression.regressed) {
+        contextBlock += `\n\n⚠️ REGRESSION DETECTED: ${regression.details.join("; ")}. The last iteration made things WORSE. Consider reverting your last changes (for example with git restore or by resetting the last commit) and trying a different approach.`;
+      }
+
+      const recentFps = summaries.filter(s => s.diffFingerprint).map(s => s.diffFingerprint!);
+      const fpSet = new Set<string>();
+      const repeated = new Set<string>();
+      for (const fp of recentFps) { if (fpSet.has(fp)) repeated.add(fp); fpSet.add(fp); }
+      if (repeated.size > 0) {
+        contextBlock += `\n\n⚠️ REPEATED APPROACH: Some iterations produced identical diffs. Avoid repeating the same strategy. Try a fundamentally different approach.`;
+      }
+
+      contextBlock += `\n\nUse this recap to avoid repeating failed approaches and continue from the best progress made so far.`;
     }
 
-    const lastSummary = summaries[summaries.length - 1];
-    if (lastSummary?.rolledBack) {
-      contextBlock += `\n\n⚠️ AUTOMATIC ROLLBACK: The previous iteration's changes were automatically reverted because of regression (${lastSummary.rollbackDetails ?? regression.details.join("; ")}). The working tree is back to the state BEFORE that iteration. Try a fundamentally different approach.`;
-    } else if (regression.regressed) {
-      contextBlock += `\n\n⚠️ REGRESSION DETECTED: ${regression.details.join("; ")}. The last iteration made things WORSE. Consider reverting your last changes (for example with git restore or by resetting the last commit) and trying a different approach.`;
+    if (contextBlock) {
+      return { systemPrompt: event.systemPrompt + contextBlock };
     }
-
-    contextBlock += `\n\nUse this recap to avoid repeating failed approaches and continue from the best progress made so far.`;
-
-    return { systemPrompt: event.systemPrompt + contextBlock };
   });
 
   pi.on("tool_result", async (event: any, ctx: any) => {
@@ -553,7 +863,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("ralph", {
-    description: "Start an autonomous ralph loop from a RALPH.md file",
+    description: "Start an autonomous ralph loop (uses RALPH.md if available, otherwise auto-detects project config)",
     handler: async (args: string, ctx: any) => {
       if (loopState.active) {
         ctx.ui.notify("A ralph loop is already running. Use /ralph-stop first.", "warning");
@@ -561,29 +871,66 @@ export default function (pi: ExtensionAPI) {
       }
 
       let name: string;
+      let isGenerated = false;
+      const specContent = readSpecContent(ctx.cwd);
+
       try {
         const ralphPath = resolveRalphPath(args ?? "", ctx.cwd);
-        const { frontmatter } = parseRalphMd(ralphPath);
-        if (!validateFrontmatter(frontmatter, ctx)) return;
-        name = basename(dirname(ralphPath));
-        loopState = {
-          active: true,
-          ralphPath,
-          iteration: 0,
-          maxIterations: frontmatter.maxIterations,
-          timeout: frontmatter.timeout,
-          completionPromise: frontmatter.completionPromise,
-          rollbackOnRegression: frontmatter.rollbackOnRegression,
-          stopRequested: false,
-          iterationSummaries: [],
-          guardrails: { blockCommands: frontmatter.guardrails.blockCommands, protectedFiles: frontmatter.guardrails.protectedFiles },
-          loopSessionFile: undefined,
-        };
+        if (ralphPath) {
+          const { frontmatter } = parseRalphMd(ralphPath);
+          if (!validateFrontmatter(frontmatter, ctx)) return;
+          name = basename(dirname(ralphPath));
+          loopState = {
+            active: true,
+            ralphPath,
+            iteration: 0,
+            maxIterations: frontmatter.maxIterations,
+            minIterations: frontmatter.minIterations,
+            timeout: frontmatter.timeout,
+            completionPromise: frontmatter.completionPromise,
+            rollbackOnRegression: frontmatter.rollbackOnRegression,
+            stopRequested: false,
+            iterationSummaries: [],
+            guardrails: { blockCommands: frontmatter.guardrails.blockCommands, protectedFiles: frontmatter.guardrails.protectedFiles },
+            loopSessionFile: undefined,
+            diffFingerprints: [],
+            specContent,
+          };
+        } else {
+          const discovery = discoverProject(ctx.cwd);
+          if (!discovery) {
+            ctx.ui.notify("No RALPH.md found and no project files detected (no package.json, Cargo.toml, Makefile, specs, or README). Create a RALPH.md to configure the loop.", "error");
+            return;
+          }
+          const generated = generateDefaultRalph(discovery);
+          if (!validateFrontmatter(generated.frontmatter, ctx)) return;
+          name = discovery.projectName;
+          isGenerated = true;
+          loopState = {
+            active: true,
+            ralphPath: "",
+            iteration: 0,
+            maxIterations: generated.frontmatter.maxIterations,
+            minIterations: generated.frontmatter.minIterations,
+            timeout: generated.frontmatter.timeout,
+            completionPromise: generated.frontmatter.completionPromise,
+            rollbackOnRegression: generated.frontmatter.rollbackOnRegression,
+            stopRequested: false,
+            iterationSummaries: [],
+            guardrails: { blockCommands: generated.frontmatter.guardrails.blockCommands, protectedFiles: generated.frontmatter.guardrails.protectedFiles },
+            loopSessionFile: undefined,
+            diffFingerprints: [],
+            specContent,
+          };
+        }
       } catch (err) {
         ctx.ui.notify(String(err), "error");
         return;
       }
-      ctx.ui.notify(`Ralph loop started: ${name} (max ${loopState.maxIterations} iterations)`, "info");
+      if (isGenerated) {
+        ctx.ui.notify(`No RALPH.md found. Using auto-detected config for "${name}". Create a RALPH.md to customize.`, "info");
+      }
+      ctx.ui.notify(`Ralph loop started: ${name} (max ${loopState.maxIterations} iterations, min ${loopState.minIterations})`, "info");
       loopState.loopSessionFile = ctx.sessionManager.getSessionFile();
       if (loopState.loopSessionFile) failCounts.set(loopState.loopSessionFile, 0);
       persistLoopState(pi, {
@@ -591,10 +938,19 @@ export default function (pi: ExtensionAPI) {
         sessionFile: loopState.loopSessionFile,
         iteration: loopState.iteration,
         maxIterations: loopState.maxIterations,
+        minIterations: loopState.minIterations,
         iterationSummaries: loopState.iterationSummaries,
         guardrails: { blockCommands: loopState.guardrails.blockCommands, protectedFiles: loopState.guardrails.protectedFiles },
         stopRequested: false,
+        specContent: loopState.specContent,
       });
+
+      if (!await isGitRepo(pi)) {
+        await gitExec(pi, "init");
+        await gitExec(pi, "add -A");
+        await gitExec(pi, "commit -m initial");
+        ctx.ui.notify("Initialized git repo for change tracking", "info");
+      }
 
       try {
         iterationLoop: for (let i = 1; i <= loopState.maxIterations; i++) {
@@ -608,13 +964,46 @@ export default function (pi: ExtensionAPI) {
 
           loopState.iteration = i;
           const iterStart = Date.now();
-          const { frontmatter: fm, body: rawBody } = parseRalphMd(loopState.ralphPath);
+          let fm: Frontmatter;
+          let rawBody: string;
+          if (loopState.ralphPath) {
+            // Hot-swap: if the file was deleted mid-loop, fall back to discovery
+            if (!existsSync(loopState.ralphPath)) {
+              const discovery = discoverProject(ctx.cwd);
+              if (!discovery) { ctx.ui.notify(`RALPH.md removed and no project files found, stopping loop`, "error"); break; }
+              const gen = generateDefaultRalph(discovery);
+              fm = gen.frontmatter;
+              rawBody = gen.body;
+              loopState.ralphPath = "";
+            } else {
+              const parsed = parseRalphMd(loopState.ralphPath);
+              fm = parsed.frontmatter;
+              rawBody = parsed.body;
+            }
+          } else {
+            // Generated mode: check if a RALPH.md appeared (hot-swap in)
+            const ralphPath = resolveRalphPath("", ctx.cwd);
+            if (ralphPath) {
+              const parsed = parseRalphMd(ralphPath);
+              fm = parsed.frontmatter;
+              rawBody = parsed.body;
+              loopState.ralphPath = ralphPath;
+              ctx.ui.notify(`Iteration ${i}: found RALPH.md, switching to file-based config`, "info");
+            } else {
+              const discovery = discoverProject(ctx.cwd);
+              if (!discovery) { ctx.ui.notify(`No project files found on iteration ${i}, stopping loop`, "error"); break; }
+              const gen = generateDefaultRalph(discovery);
+              fm = gen.frontmatter;
+              rawBody = gen.body;
+            }
+          }
           if (!validateFrontmatter(fm, ctx)) {
-            ctx.ui.notify(`Invalid RALPH.md on iteration ${i}, stopping loop`, "error");
+            ctx.ui.notify(`Invalid config on iteration ${i}, stopping loop`, "error");
             break;
           }
 
           loopState.maxIterations = fm.maxIterations;
+          loopState.minIterations = fm.minIterations;
           loopState.timeout = fm.timeout;
           loopState.completionPromise = fm.completionPromise;
           loopState.rollbackOnRegression = fm.rollbackOnRegression;
@@ -633,8 +1022,19 @@ export default function (pi: ExtensionAPI) {
             }
           }
 
-          const outputs = await runCommands(fm.commands, pi);
-          let body = resolvePlaceholders(rawBody, outputs, { iteration: i, name });
+          const outputs = await runCommands(fm.commands, pi, fm.parallel);
+          let gitContext: { diff: string; log: string } | undefined;
+          if (rawBody.includes("{{ git.diff") || rawBody.includes("{{ git.log")) {
+            const isRepo = await isGitRepo(pi);
+            if (isRepo) {
+              const [diffResult, logResult] = await Promise.all([
+                gitExec(pi, "diff HEAD~1"),
+                gitExec(pi, "log --oneline -5"),
+              ]);
+              gitContext = { diff: diffResult.ok ? diffResult.output : "", log: logResult.ok ? logResult.output : "" };
+            }
+          }
+          let body = resolvePlaceholders(rawBody, outputs, { iteration: i, name }, gitContext);
           body = body.replace(/<!--[\s\S]*?-->/g, "");
           const prompt = `[ralph: iteration ${i}/${loopState.maxIterations}]\n\n${body}`;
 
@@ -649,10 +1049,14 @@ export default function (pi: ExtensionAPI) {
             sessionFile: loopState.loopSessionFile,
             iteration: loopState.iteration,
             maxIterations: loopState.maxIterations,
+            minIterations: loopState.minIterations,
             iterationSummaries: loopState.iterationSummaries,
             guardrails: { blockCommands: loopState.guardrails.blockCommands, protectedFiles: loopState.guardrails.protectedFiles },
             stopRequested,
+            specContent: loopState.specContent,
           });
+
+          const fingerprintBefore = await isGitRepo(pi) ? await getWorkingTreeFingerprint(pi) : "";
 
           const iterationEntryStart = ctx.sessionManager.getEntries().length;
           const agentDone = new Promise<void>((resolve) => { onAgentEnd = resolve; });
@@ -682,16 +1086,26 @@ export default function (pi: ExtensionAPI) {
           onAgentEnd = undefined;
 
           const elapsed = Math.round((Date.now() - iterStart) / 1000);
-          const commandSummaries = outputs.map(summarizeCommandOutput);
+          const fingerprintAfter = fingerprintBefore ? await getWorkingTreeFingerprint(pi) : "";
+          const hadChanges = Boolean(fingerprintBefore && fingerprintAfter && fingerprintBefore !== fingerprintAfter);
+
+          const commandSummaries = outputs.map((o, idx) => summarizeCommandOutput(o, fm.commands[idx]));
           const entriesAfterIteration = ctx.sessionManager.getEntries();
           const assistantRecap = latestAssistantRecap(entriesAfterIteration, iterationEntryStart);
           const signals = aggregateSignals(commandSummaries);
+          let diffFp = "";
+          if (hadChanges && await isGitRepo(pi)) {
+            diffFp = await getDiffFingerprint(pi);
+          }
+
           const tentativeSummary: IterationSummary = {
             iteration: i,
             duration: elapsed,
             assistantRecap,
             commandSummaries,
             signals,
+            hadChanges,
+            diffFingerprint: diffFp || undefined,
           };
           const regression = detectRegression([...loopState.iterationSummaries, tentativeSummary]);
           tentativeSummary.regressed = regression.regressed;
@@ -715,18 +1129,22 @@ export default function (pi: ExtensionAPI) {
 
           const summary = tentativeSummary;
           loopState.iterationSummaries.push(summary);
+          if (diffFp) loopState.diffFingerprints.push(diffFp);
           const persistedBeforeFinalPersist = readPersistedLoopState(ctx);
           const stopRequestedAfterSummary =
             loopState.stopRequested || Boolean(persistedBeforeFinalPersist?.active && persistedBeforeFinalPersist.stopRequested);
           loopState.stopRequested = stopRequestedAfterSummary;
+          const compactSummaries = loopState.iterationSummaries.slice(-MAX_PERSIST_SUMMARIES);
           persistLoopState(pi, {
             active: true,
             sessionFile: loopState.loopSessionFile,
             iteration: loopState.iteration,
             maxIterations: loopState.maxIterations,
-            iterationSummaries: loopState.iterationSummaries,
+            minIterations: loopState.minIterations,
+            iterationSummaries: compactSummaries,
             guardrails: { blockCommands: loopState.guardrails.blockCommands, protectedFiles: loopState.guardrails.protectedFiles },
             stopRequested: stopRequestedAfterSummary,
+            specContent: loopState.specContent,
           });
           pi.appendEntry("ralph-iteration", { iteration: i, duration: elapsed, summary, ralphPath: loopState.ralphPath });
 
@@ -756,6 +1174,54 @@ export default function (pi: ExtensionAPI) {
             }
           }
 
+          // Done criteria: re-run commands post-iteration for accurate verification (skipped until min_iterations reached)
+          if (fm.doneCriteria?.length && i >= fm.minIterations) {
+            const verifyOutputs = await runCommands(fm.commands, pi, fm.parallel);
+            const verifySummaries = verifyOutputs.map((o, idx) => summarizeCommandOutput(o, fm.commands[idx]));
+            const { allMet, unmet } = checkDoneCriteria(fm.doneCriteria, verifyOutputs);
+            if (allMet && verifySummaries.every(cs => cs.status === "ok")) {
+              ctx.ui.notify(`Iteration ${i}: all done criteria verified after agent work — loop complete`, "info");
+              break iterationLoop;
+            }
+            if (unmet.length) {
+              ctx.ui.notify(`Iteration ${i}: unmet criteria: ${unmet.join(", ")}`, "info");
+            }
+          }
+
+          // Auto-completion: all commands green + no changes = task done (skipped until min_iterations reached)
+          if (!hadChanges && !assistantRecap && commandSummaries.every(cs => cs.status === "ok") && i >= fm.minIterations) {
+            const hadPriorWork = loopState.iterationSummaries.slice(0, -1).some(s => s.hadChanges || s.assistantRecap);
+            if (hadPriorWork) {
+              ctx.ui.notify(`Iteration ${i}: all checks pass, no changes needed — loop complete`, "info");
+              break iterationLoop;
+            }
+          }
+
+          // Diff repetition: same diff fingerprint as a previous iteration
+          if (diffFp && loopState.diffFingerprints.slice(0, -1).includes(diffFp)) {
+            const prevIter = loopState.iterationSummaries.find((s, idx) => idx < loopState.iterationSummaries.length - 1 && s.diffFingerprint === diffFp);
+            ctx.ui.notify(`Iteration ${i}: repeated approach (same diff as iteration ${prevIter?.iteration ?? "?"}), stopping`, "warning");
+            break iterationLoop;
+          }
+
+          // Green streak limit: too many consecutive all-green iterations with changes suggests diminishing returns
+          if (fm.greenStreakLimit > 0) {
+            const recentGreen = loopState.iterationSummaries.slice(-fm.greenStreakLimit);
+            if (recentGreen.length >= fm.greenStreakLimit && recentGreen.every(s =>
+              s.hadChanges && !s.regressed && s.commandSummaries.every(cs => cs.status === "ok")
+            )) {
+              ctx.ui.notify(`Iteration ${i}: ${fm.greenStreakLimit} consecutive green iterations — consider the task complete or refine RALPH.md`, "warning");
+              break iterationLoop;
+            }
+          }
+
+          // Stall detection: N consecutive iterations with no changes and no recap
+          const tail = loopState.iterationSummaries.slice(-STALL_THRESHOLD);
+          if (tail.length >= STALL_THRESHOLD && tail.every(s => !s.hadChanges && !s.assistantRecap)) {
+            ctx.ui.notify(`Ralph loop auto-stopping: ${STALL_THRESHOLD} consecutive iterations with no changes or progress`, "warning");
+            break iterationLoop;
+          }
+
           ctx.ui.notify(`Iteration ${i} complete (${elapsed}s)`, "info");
         }
 
@@ -770,6 +1236,7 @@ export default function (pi: ExtensionAPI) {
         loopState.active = false;
         loopState.stopRequested = false;
         loopState.loopSessionFile = undefined;
+        loopState.diffFingerprints = [];
         ctx.ui.setStatus("ralph", undefined);
         persistLoopState(pi, { active: false });
       }

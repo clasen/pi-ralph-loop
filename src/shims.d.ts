@@ -9,6 +9,7 @@ declare module "minimatch" {
 declare module "node:fs" {
   export function readFileSync(path: string, encoding: string): string;
   export function existsSync(path: string): boolean;
+  export function readdirSync(path: string): string[];
 }
 
 declare module "node:path" {

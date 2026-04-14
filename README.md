@@ -2,13 +2,28 @@
 
 Autonomous coding loops for pi with mid-turn supervision.
 
+This project is a fork of `@lnilluv/pi-ralph-loop` with additional reliability and safety improvements for iterative coding loops.
+
 ## Install
 
 ```bash
-pi install npm:@lnilluv/pi-ralph-loop
+pi install git:https://github.com/clasen/pi-ralph-loop
 ```
 
+## What's changed in this fork
+
+- Command output injection with `{{ commands.<name> }}` placeholders.
+- Session-scoped guardrails (`block_commands`, `protected_files`).
+- Cross-iteration memory injected into the next run.
+- Mid-turn steering after repeated failures in the same iteration.
+- Completion promise support via `<promise>DONE</promise>`.
+- Per-iteration timeout to avoid stuck runs.
+- Frontmatter input validation before and during loop execution.
+- Automatic rollback on regression with optional `git stash` recovery.
+
 ## Quick start
+
+### Option A: explicit `RALPH.md`
 
 ```md
 # my-task/RALPH.md
@@ -25,9 +40,20 @@ Fix failing tests using this output:
 
 Run `/ralph my-task` in pi.
 
+### Option B: no `RALPH.md` (auto mode)
+
+If `RALPH.md` is missing, `/ralph` auto-detects project context and generates a loop config:
+
+- Detects ecosystem and commands from files like `package.json`, `Cargo.toml`, `pyproject.toml`, or `Makefile`.
+- Looks for project docs (`specs.md`, `spec.md`, `TASK.md`, `TODO.md`, and `README*`).
+- Injects that documentation as authoritative context so the agent can implement against it.
+- Enables safe defaults (including regression rollback and guardrails) that you can later override by adding a `RALPH.md`.
+
+Run `/ralph` from the project root to use this mode.
+
 ## How it works
 
-On each iteration, pi-ralph reads `RALPH.md`, runs the configured commands, injects their output into the prompt through `{{ commands.<name> }}` placeholders, starts a fresh session, sends the prompt, and waits for completion. Failed test output appears in the next iteration, which creates a self-healing loop.
+On each iteration, pi-ralph reads `RALPH.md` (or uses auto-generated config if `RALPH.md` is missing), runs the configured commands, injects their output into the prompt through `{{ commands.<name> }}` placeholders, starts a fresh session, sends the prompt, and waits for completion. Failed test output appears in the next iteration, which creates a self-healing loop.
 
 ## RALPH.md format
 
@@ -91,7 +117,7 @@ HTML comments (`<!-- ... -->`) are stripped from the prompt body after placehold
 
 ## Commands
 
-- `/ralph <path>`: Start the loop from a `RALPH.md` file or directory.
+- `/ralph <path>`: Start from a `RALPH.md` file/directory, or auto-detect project config when `RALPH.md` is absent.
 - `/ralph-stop`: Request a graceful stop after the current iteration.
 
 ## Pi-only features
