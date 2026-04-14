@@ -70,6 +70,10 @@ max_iterations: 25
 timeout: 300
 completion_promise: "DONE"
 rollback_on_regression: true
+objective:
+  metric: test_failures
+  mode: minimize
+acceptance_rule: non_regression
 guardrails:
   block_commands:
     - "rm\\s+-rf\\s+/"
@@ -98,10 +102,15 @@ Apply the smallest safe fix and explain why it works.
 | `commands[].name` | string | required | Key for `{{ commands.<name> }}` |
 | `commands[].run` | string | required | Shell command |
 | `commands[].timeout` | number | `60` | Seconds before kill |
+| `commands[].run_every` | number | — | Run only every N iterations (always runs on iteration 1 and last) |
 | `max_iterations` | number | `50` | Stop after N iterations |
 | `timeout` | number | `300` | Per-iteration timeout in seconds; stops the loop if the agent is stuck |
 | `completion_promise` | string | — | Agent signals completion by sending `<promise>DONE</promise>`; loop breaks on match |
 | `rollback_on_regression` | boolean | `false` | Auto-revert working tree via `git stash` when metrics regress between iterations |
+| `objective` | string/object | — | Objective metric used to accept/reject each iteration (`test_failures`, `tests_passed`, `lint_errors`, `lint_warnings`) |
+| `objective.metric` | string | required if `objective` is set | Metric to optimize |
+| `objective.mode` | string | metric default | `minimize` or `maximize`; defaults depend on metric |
+| `acceptance_rule` | string | `non_regression` | `non_regression` (allow equal) or `strict_improvement` (must improve) |
 | `guardrails.block_commands` | string[] | `[]` | Regex patterns to block in bash |
 | `guardrails.protected_files` | string[] | `[]` | Glob patterns to block writes |
 
@@ -142,11 +151,37 @@ When `completion_promise` is set (e.g., `"DONE"`), the loop scans the agent's me
 
 Each iteration has a configurable timeout (default 300 seconds). If the agent is stuck and doesn't become idle within the timeout, the loop stops with a warning. This prevents runaway iterations from running forever.
 
+### Provider error handling
+
+When the model returns an error (quota exceeded, rate limit, auth failure, network issue), the extension classifies it and applies the appropriate recovery policy:
+
+- **quota_exceeded**: pauses the loop immediately (no more iterations wasted).
+- **rate_limit / transient**: retries with exponential backoff (up to 2 retries).
+- **auth / unknown**: stops the loop.
+
+### Convergence detection
+
+After `min_iterations`, if the last N iterations (default 3) produced no file changes and all tracked metrics are stable, the loop stops automatically. This prevents wasting iterations when the task is effectively done.
+
+### Adaptive command scheduling
+
+Commands with `run_every: N` only execute on matching iterations (always on iteration 1 and the last). In auto-mode, benchmarks default to `run_every: 3` to reduce overhead on iterations focused on correctness.
+
 ### Automatic rollback on regression
 
 When `rollback_on_regression: true` is set, the extension creates a `git stash` snapshot before each iteration (starting from iteration 2). After the agent finishes, metrics are compared to the previous iteration. If a regression is detected (more test failures, fewer tests passing, or more lint errors), the working tree is automatically reverted to the pre-iteration state and the stash is consumed. The next iteration's system prompt explicitly tells the agent that the changes were rolled back and why, so it can try a different approach instead of building on broken code.
 
 Requirements: the project must be inside a git repository. If git is unavailable or the stash operation fails, the loop continues normally with a warning — it never breaks the loop.
+
+### Objective-based acceptance (minimal autoresearch behavior)
+
+Use `objective` + `acceptance_rule` to enforce a single primary metric for keep/reject decisions:
+
+- Example objective: minimize `test_failures` or maximize `tests_passed`.
+- `non_regression`: keep equal-or-better iterations.
+- `strict_improvement`: require strict improvement each iteration (after baseline).
+
+If `rollback_on_regression: true` is enabled, an iteration that fails the objective acceptance rule is also rolled back automatically.
 
 ### Input validation
 
@@ -154,20 +189,20 @@ The extension validates `RALPH.md` frontmatter before starting and on each re-pa
 
 ## Comparison table
 
-| Feature | **@lnilluv/pi-ralph-loop** | pi-ralph | pi-ralph-wiggum | ralphi | ralphify |
-|---------|------------------------|----------------------|-----------------|--------|----------|
-| Command output injection | ✓ | ✗ | ✗ | ✗ | ✓ |
-| Fresh-context sessions | ✓ | ✓ | ✗ | ✓ | ✓ |
-| Mid-turn guardrails | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Cross-iteration memory | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Mid-turn steering | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Live prompt editing | ✓ | ✗ | ✗ | ✗ | ✓ |
-| Completion promise | ✓ | ✗ | ✗ | ✗ | ✓ |
-| Iteration timeout | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Session-scoped hooks | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Input validation | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Auto-rollback on regression | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Setup required | RALPH.md | config | RALPH.md | PRD pipeline | RALPH.md |
+| Feature | **@clasen/pi-ralph-loop** | **@lnilluv/pi-ralph-loop** | pi-ralph | pi-ralph-wiggum |
+|---------|--------------------------|---------------------------|----------|-----------------|
+| Command output injection | ✓ | ✓ | ✗ | ✗ |
+| Fresh-context sessions | ✓ | ✓ | ✓ | ✗ |
+| Mid-turn guardrails | ✓ | ✓ | ✗ | ✗ |
+| Cross-iteration memory | ✓ | ✓ | ✗ | ✗ |
+| Mid-turn steering | ✓ | ✓ | ✗ | ✗ |
+| Live prompt editing | ✗ | ✓ | ✗ | ✗ |
+| Completion promise | ✓ | ✓ | ✗ | ✗ |
+| Iteration timeout | ✓ | ✓ | ✗ | ✗ |
+| Session-scoped hooks | ✓ | ✓ | ✗ | ✗ |
+| Input validation | ✓ | ✓ | ✗ | ✗ |
+| Auto-rollback on regression | ✓ | ✓ | ✗ | ✗ |
+| Setup required | auto | RALPH.md | config | RALPH.md |
 
 ## License
 

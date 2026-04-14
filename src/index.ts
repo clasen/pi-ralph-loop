@@ -4,8 +4,12 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { resolve, join, dirname, basename } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-type CommandDef = { name: string; run: string; timeout: number; maxOutput?: number; signalPatterns?: Record<string, string[]> };
+type CommandDef = { name: string; run: string; timeout: number; maxOutput?: number; signalPatterns?: Record<string, string[]>; runEvery?: number };
 type DoneCriterion = { name: string; command: string; pattern: string };
+type ObjectiveMetric = "test_failures" | "tests_passed" | "lint_errors" | "lint_warnings";
+type ObjectiveMode = "minimize" | "maximize";
+type ObjectiveDef = { metric: ObjectiveMetric; mode?: ObjectiveMode };
+type AcceptanceRule = "non_regression" | "strict_improvement";
 type Frontmatter = {
   commands: CommandDef[];
   maxIterations: number;
@@ -15,6 +19,8 @@ type Frontmatter = {
   rollbackOnRegression: boolean;
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
   doneCriteria?: DoneCriterion[];
+  objective?: ObjectiveDef;
+  acceptanceRule: AcceptanceRule;
   greenStreakLimit: number;
   parallel: boolean;
 };
@@ -35,6 +41,9 @@ type IterationSummary = {
   rollbackDetails?: string;
   hadChanges?: boolean;
   diffFingerprint?: string;
+  objectiveValue?: number;
+  objectiveAccepted?: boolean;
+  objectiveReason?: string;
 };
 type LoopState = {
   active: boolean;
@@ -65,7 +74,37 @@ type PersistedLoopState = {
 };
 
 function defaultFrontmatter(): Frontmatter {
-  return { commands: [], maxIterations: 50, minIterations: 1, timeout: 300, rollbackOnRegression: false, guardrails: { blockCommands: [], protectedFiles: [] }, greenStreakLimit: 0, parallel: false };
+  return {
+    commands: [],
+    maxIterations: 50,
+    minIterations: 1,
+    timeout: 300,
+    rollbackOnRegression: false,
+    guardrails: { blockCommands: [], protectedFiles: [] },
+    acceptanceRule: "non_regression",
+    greenStreakLimit: 0,
+    parallel: false,
+  };
+}
+
+const OBJECTIVE_METRICS: ObjectiveMetric[] = ["test_failures", "tests_passed", "lint_errors", "lint_warnings"];
+const ACCEPTANCE_RULES: AcceptanceRule[] = ["non_regression", "strict_improvement"];
+
+function parseObjective(raw: unknown): ObjectiveDef | undefined {
+  if (!raw) return undefined;
+  if (typeof raw === "string") {
+    const metric = raw.trim() as ObjectiveMetric;
+    return OBJECTIVE_METRICS.includes(metric) ? { metric } : undefined;
+  }
+  if (typeof raw !== "object") return undefined;
+  const objective = raw as Record<string, unknown>;
+  const metric = String(objective.metric ?? "").trim() as ObjectiveMetric;
+  if (!OBJECTIVE_METRICS.includes(metric)) return undefined;
+  const modeRaw = objective.mode;
+  const mode = typeof modeRaw === "string" && (modeRaw === "minimize" || modeRaw === "maximize")
+    ? (modeRaw as ObjectiveMode)
+    : undefined;
+  return { metric, mode };
 }
 
 function parseRalphMd(filePath: string): ParsedRalph {
@@ -87,6 +126,7 @@ function parseRalphMd(filePath: string): ParsedRalph {
           timeout: Number(c.timeout ?? 60),
           maxOutput: typeof c.max_output === "number" ? c.max_output : undefined,
           signalPatterns,
+          runEvery: typeof c.run_every === "number" && c.run_every > 0 ? c.run_every : undefined,
         };
       })
     : [];
@@ -98,6 +138,11 @@ function parseRalphMd(filePath: string): ParsedRalph {
         pattern: String(d.pattern ?? ""),
       }))
     : undefined;
+  const objective = parseObjective(yaml.objective);
+  const acceptanceRuleRaw = String(yaml.acceptance_rule ?? "non_regression");
+  const acceptanceRule: AcceptanceRule = ACCEPTANCE_RULES.includes(acceptanceRuleRaw as AcceptanceRule)
+    ? (acceptanceRuleRaw as AcceptanceRule)
+    : "non_regression";
 
   return {
     frontmatter: {
@@ -113,6 +158,8 @@ function parseRalphMd(filePath: string): ParsedRalph {
         protectedFiles: Array.isArray(guardrails.protected_files) ? guardrails.protected_files.map((p: unknown) => String(p)) : [],
       },
       doneCriteria,
+      objective,
+      acceptanceRule,
       greenStreakLimit: Number(yaml.green_streak_limit ?? 0),
       parallel: yaml.parallel === true,
     },
@@ -148,6 +195,14 @@ function validateFrontmatter(fm: Frontmatter, ctx: any): boolean {
       ctx.ui.notify(`Invalid command ${cmd.name}: timeout must be positive`, "error");
       return false;
     }
+  }
+  if (!ACCEPTANCE_RULES.includes(fm.acceptanceRule)) {
+    ctx.ui.notify(`Invalid acceptance_rule: must be one of ${ACCEPTANCE_RULES.join(", ")}`, "error");
+    return false;
+  }
+  if (fm.objective && !OBJECTIVE_METRICS.includes(fm.objective.metric)) {
+    ctx.ui.notify(`Invalid objective.metric: must be one of ${OBJECTIVE_METRICS.join(", ")}`, "error");
+    return false;
   }
   return true;
 }
@@ -211,7 +266,6 @@ function discoverProject(cwd: string): ProjectDiscovery | null {
       if (scripts.test && !seen.has(scripts.test)) {
         seen.add(scripts.test);
         commands.push({ name: "tests", run: "npm test", timeout: 120, maxOutput: 4000 });
-        doneCriteria.push({ name: "tests_green", command: "tests", pattern: "# fail 0|0 failed|0 failing" });
       }
       if (scripts.lint && !seen.has(scripts.lint)) {
         seen.add(scripts.lint);
@@ -219,17 +273,16 @@ function discoverProject(cwd: string): ProjectDiscovery | null {
       }
       if (scripts.benchmark && !seen.has(scripts.benchmark)) {
         seen.add(scripts.benchmark);
-        commands.push({ name: "benchmark", run: "npm run benchmark", timeout: 600, maxOutput: 6000 });
+        commands.push({ name: "benchmark", run: "npm run benchmark", timeout: 600, maxOutput: 6000, runEvery: 3 });
       } else if (scripts.bench && !seen.has(scripts.bench)) {
         seen.add(scripts.bench);
-        commands.push({ name: "benchmark", run: "npm run bench", timeout: 600, maxOutput: 6000 });
+        commands.push({ name: "benchmark", run: "npm run bench", timeout: 600, maxOutput: 6000, runEvery: 3 });
       }
     } catch { /* malformed package.json, still continue */ }
   } else if (has("Cargo.toml")) {
     ecosystem = "rust";
     commands.push({ name: "tests", run: "cargo test", timeout: 300, maxOutput: 4000 });
     commands.push({ name: "lint", run: "cargo clippy -- -D warnings", timeout: 120, maxOutput: 2000 });
-    doneCriteria.push({ name: "tests_green", command: "tests", pattern: "test result: ok" });
   } else if (has("pyproject.toml") || has("setup.py") || has("requirements.txt")) {
     ecosystem = "python";
     if (has("pyproject.toml")) {
@@ -246,7 +299,6 @@ function discoverProject(cwd: string): ProjectDiscovery | null {
     if (commands.length === 0) {
       commands.push({ name: "tests", run: "pytest", timeout: 300, maxOutput: 4000 });
     }
-    doneCriteria.push({ name: "tests_green", command: "tests", pattern: "passed|0 failed" });
   } else if (has("Makefile") || has("makefile")) {
     ecosystem = "make";
     commands.push({ name: "tests", run: "make test", timeout: 300, maxOutput: 4000 });
@@ -262,6 +314,11 @@ function discoverProject(cwd: string): ProjectDiscovery | null {
 function generateDefaultRalph(discovery: ProjectDiscovery): ParsedRalph {
   const { specFile, readmeFile, commands, doneCriteria } = discovery;
 
+  const hasTests = commands.some(c => c.name === "tests");
+  const autoObjective: ObjectiveDef | undefined = hasTests
+    ? { metric: "test_failures", mode: "minimize" }
+    : undefined;
+
   const frontmatter: Frontmatter = {
     commands,
     maxIterations: 25,
@@ -273,6 +330,8 @@ function generateDefaultRalph(discovery: ProjectDiscovery): ParsedRalph {
       protectedFiles: specFile ? [specFile] : [],
     },
     doneCriteria: doneCriteria.length ? doneCriteria : undefined,
+    objective: autoObjective,
+    acceptanceRule: "non_regression",
     greenStreakLimit: 10,
     parallel: commands.length > 1,
   };
@@ -334,6 +393,7 @@ const MAX_COMMAND_EXCERPT = 220;
 const MAX_CONTEXT_ITERATIONS = 5;
 const MAX_PERSIST_SUMMARIES = 10;
 const STALL_THRESHOLD = 3;
+const CONVERGENCE_WINDOW = 3;
 
 function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -392,6 +452,13 @@ const DEFAULT_SIGNAL_PATTERNS: Record<string, RegExp[]> = {
   ],
 };
 
+const OBJECTIVE_META: Record<ObjectiveMetric, { signalKey: keyof CommandSignals; label: string; defaultMode: ObjectiveMode }> = {
+  test_failures: { signalKey: "testFailures", label: "test failures", defaultMode: "minimize" },
+  tests_passed: { signalKey: "testPassed", label: "tests passed", defaultMode: "maximize" },
+  lint_errors: { signalKey: "lintErrors", label: "lint errors", defaultMode: "minimize" },
+  lint_warnings: { signalKey: "lintWarnings", label: "lint warnings", defaultMode: "minimize" },
+};
+
 function buildSignalPatterns(custom?: Record<string, string[]>): Record<string, RegExp[]> {
   if (!custom) return DEFAULT_SIGNAL_PATTERNS;
   const merged = { ...DEFAULT_SIGNAL_PATTERNS };
@@ -425,9 +492,11 @@ function summarizeCommandOutput(output: CommandOutput, cmdDef?: CommandDef): Ite
     status = "timed_out";
   } else if (/^\[error:/i.test(trimmed)) {
     status = "error";
-  } else if (output.exitCode !== undefined && output.exitCode !== 0) {
-    status = "failed";
-  } else {
+  } else if (output.exitCode !== undefined) {
+    status = output.exitCode === 0 ? "ok" : "failed";
+  }
+  // No exitCode available (legacy/fallback): use text heuristics as last resort
+  else {
     const sanitized = trimmed.replace(/\b(fail(?:ed|ures?|s)?)\s*[:=]?\s*0\b/gi, "___ZERO___");
     if (/\bFAIL(?:ED)?\b|\bERROR\b|error:|failed/i.test(sanitized)) status = "failed";
   }
@@ -516,6 +585,9 @@ function normalizeIterationSummary(summary: any): IterationSummary {
     rollbackDetails: typeof summary.rollbackDetails === "string" ? summary.rollbackDetails : undefined,
     hadChanges: typeof summary.hadChanges === "boolean" ? summary.hadChanges : undefined,
     diffFingerprint: typeof summary.diffFingerprint === "string" ? summary.diffFingerprint : undefined,
+    objectiveValue: typeof summary.objectiveValue === "number" ? summary.objectiveValue : undefined,
+    objectiveAccepted: typeof summary.objectiveAccepted === "boolean" ? summary.objectiveAccepted : undefined,
+    objectiveReason: typeof summary.objectiveReason === "string" ? summary.objectiveReason : undefined,
   };
 
   if (!normalized.commandSummaries.length && !summary.signals) {
@@ -604,6 +676,90 @@ function detectRegression(summaries: IterationSummary[]): RegressionResult {
   return { regressed: details.length > 0, details };
 }
 
+type ConvergenceResult = { converged: boolean; reason: string };
+
+function detectConvergence(summaries: IterationSummary[], window: number): ConvergenceResult {
+  if (summaries.length < window) return { converged: false, reason: "" };
+  const tail = summaries.slice(-window);
+
+  const noChanges = tail.every(s => !s.hadChanges);
+  if (!noChanges) return { converged: false, reason: "" };
+
+  const signalKeys: (keyof CommandSignals)[] = ["testFailures", "testPassed", "lintErrors", "lintWarnings"];
+  let metricsStable = true;
+  for (const key of signalKeys) {
+    const values = tail.map(s => s.signals[key]).filter((v): v is number => typeof v === "number");
+    if (values.length >= 2) {
+      const unique = new Set(values);
+      if (unique.size > 1) { metricsStable = false; break; }
+    }
+  }
+
+  if (metricsStable) {
+    return { converged: true, reason: `${window} consecutive iterations with no file changes and stable metrics` };
+  }
+  return { converged: false, reason: "" };
+}
+
+type ObjectiveEvaluation = { value?: number; accepted: boolean; reason: string };
+
+function evaluateObjective(summaries: IterationSummary[], objective: ObjectiveDef, rule: AcceptanceRule): ObjectiveEvaluation {
+  const meta = OBJECTIVE_META[objective.metric];
+  const mode = objective.mode ?? meta.defaultMode;
+  const current = summaries[summaries.length - 1];
+  const currentVal = current?.signals[meta.signalKey];
+
+  if (typeof currentVal !== "number") {
+    return { accepted: true, reason: `objective "${objective.metric}" unavailable in current outputs` };
+  }
+
+  for (let i = summaries.length - 2; i >= 0; i--) {
+    const prevVal = summaries[i].signals[meta.signalKey];
+    if (typeof prevVal !== "number") continue;
+    if (mode === "minimize") {
+      if (rule === "strict_improvement") {
+        const accepted = currentVal < prevVal;
+        return {
+          value: currentVal,
+          accepted,
+          reason: accepted
+            ? `${meta.label} improved: ${prevVal} -> ${currentVal}`
+            : `${meta.label} did not strictly improve: ${prevVal} -> ${currentVal}`,
+        };
+      }
+      const accepted = currentVal <= prevVal;
+      return {
+        value: currentVal,
+        accepted,
+        reason: accepted
+          ? `${meta.label} non-regression: ${prevVal} -> ${currentVal}`
+          : `${meta.label} regressed: ${prevVal} -> ${currentVal}`,
+      };
+    }
+
+    if (rule === "strict_improvement") {
+      const accepted = currentVal > prevVal;
+      return {
+        value: currentVal,
+        accepted,
+        reason: accepted
+          ? `${meta.label} improved: ${prevVal} -> ${currentVal}`
+          : `${meta.label} did not strictly improve: ${prevVal} -> ${currentVal}`,
+      };
+    }
+    const accepted = currentVal >= prevVal;
+    return {
+      value: currentVal,
+      accepted,
+      reason: accepted
+        ? `${meta.label} non-regression: ${prevVal} -> ${currentVal}`
+        : `${meta.label} regressed: ${prevVal} -> ${currentVal}`,
+    };
+  }
+
+  return { value: currentVal, accepted: true, reason: `objective baseline initialized at ${currentVal}` };
+}
+
 function latestAssistantRecap(entries: any[], startIndex: number): string {
   for (let i = entries.length - 1; i >= startIndex; i--) {
     const text = extractAssistantText(entries[i]);
@@ -611,6 +767,33 @@ function latestAssistantRecap(entries: any[], startIndex: number): string {
   }
   return "";
 }
+
+type ProviderErrorKind = "rate_limit" | "quota_exceeded" | "auth" | "transient" | "unknown";
+type ProviderErrorPolicy = "pause" | "retry" | "stop";
+
+function classifyProviderError(entry: any): ProviderErrorKind | null {
+  if (entry?.type !== "message" || entry?.message?.role !== "assistant") return null;
+  const msg = entry.message;
+  if (msg.stopReason !== "error" || !msg.errorMessage) return null;
+
+  const err = String(msg.errorMessage).toLowerCase();
+  if (/usage limit|quota|exceeded.*plan|limit.*plan/.test(err)) return "quota_exceeded";
+  if (/rate.?limit|too many requests|429/.test(err)) return "rate_limit";
+  if (/auth|unauthorized|forbidden|401|403/.test(err)) return "auth";
+  if (/timeout|econnreset|enotfound|network|5\d\d/.test(err)) return "transient";
+  return "unknown";
+}
+
+const PROVIDER_ERROR_POLICIES: Record<ProviderErrorKind, ProviderErrorPolicy> = {
+  quota_exceeded: "pause",
+  rate_limit: "retry",
+  auth: "stop",
+  transient: "retry",
+  unknown: "stop",
+};
+
+const MAX_PROVIDER_RETRIES = 2;
+const RATE_LIMIT_BACKOFF_MS = 15_000;
 
 const STASH_PREFIX = "ralph-snapshot-iter-";
 
@@ -684,13 +867,17 @@ async function getDiffFingerprint(pi: ExtensionAPI): Promise<string> {
 }
 
 function checkDoneCriteria(criteria: DoneCriterion[], outputs: CommandOutput[]): { allMet: boolean; unmet: string[] } {
-  const outputMap = new Map(outputs.map((o) => [o.name, o.output]));
+  const outputMap = new Map(outputs.map((o) => [o.name, o]));
   const unmet: string[] = [];
   for (const c of criteria) {
-    const text = outputMap.get(c.command);
-    if (!text) { unmet.push(`${c.name}: command '${c.command}' not found`); continue; }
+    const cmd = outputMap.get(c.command);
+    if (!cmd) { unmet.push(`${c.name}: command '${c.command}' not found`); continue; }
+    if (c.pattern === "__exit_code_zero__") {
+      if (cmd.exitCode !== undefined && cmd.exitCode !== 0) unmet.push(c.name);
+      continue;
+    }
     try {
-      if (!new RegExp(c.pattern).test(text)) unmet.push(c.name);
+      if (!new RegExp(c.pattern).test(cmd.output)) unmet.push(c.name);
     } catch {
       unmet.push(`${c.name}: invalid pattern`);
     }
@@ -815,6 +1002,11 @@ export default function (pi: ExtensionAPI) {
       } else if (regression.regressed) {
         contextBlock += `\n\n⚠️ REGRESSION DETECTED: ${regression.details.join("; ")}. The last iteration made things WORSE. Consider reverting your last changes (for example with git restore or by resetting the last commit) and trying a different approach.`;
       }
+      if (lastSummary?.objectiveAccepted === false) {
+        contextBlock += `\n\n⚠️ OBJECTIVE MISSED: ${lastSummary.objectiveReason ?? "the configured objective acceptance rule was not met"}.`;
+      } else if (lastSummary?.objectiveReason) {
+        contextBlock += `\n\nObjective status: ${lastSummary.objectiveReason}`;
+      }
 
       const recentFps = summaries.filter(s => s.diffFingerprint).map(s => s.diffFingerprint!);
       const fpSet = new Set<string>();
@@ -834,8 +1026,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_result", async (event: any, ctx: any) => {
     if (!isLoopSession(ctx) || event.toolName !== "bash") return;
-    const output = event.content.map((c: { type: string; text?: string }) => (c.type === "text" ? c.text ?? "" : "")).join("");
-    if (!/FAIL|ERROR|error:|failed/i.test(output)) return;
+
+    const exitCode = typeof event.exitCode === "number" ? event.exitCode : undefined;
+    const isFailure = exitCode !== undefined ? exitCode !== 0 : false;
+    if (!isFailure) return;
 
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile) return;
@@ -846,7 +1040,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [
           ...event.content,
-          { type: "text" as const, text: "\n\n⚠️ ralph: 3+ failures this iteration. Stop and describe the root cause before retrying." },
+          { type: "text" as const, text: "\n\n⚠️ ralph: 3+ non-zero exit codes this iteration. Stop and describe the root cause before retrying." },
         ],
       };
     }
@@ -931,6 +1125,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`No RALPH.md found. Using auto-detected config for "${name}". Create a RALPH.md to customize.`, "info");
       }
       ctx.ui.notify(`Ralph loop started: ${name} (max ${loopState.maxIterations} iterations, min ${loopState.minIterations})`, "info");
+      const providerRetryCounts = new Map<string, number>();
       loopState.loopSessionFile = ctx.sessionManager.getSessionFile();
       if (loopState.loopSessionFile) failCounts.set(loopState.loopSessionFile, 0);
       persistLoopState(pi, {
@@ -1022,7 +1217,16 @@ export default function (pi: ExtensionAPI) {
             }
           }
 
-          const outputs = await runCommands(fm.commands, pi, fm.parallel);
+          const scheduledCommands = fm.commands.filter(cmd =>
+            !cmd.runEvery || i === 1 || i % cmd.runEvery === 0 || i === fm.maxIterations
+          );
+          const skippedCommands = fm.commands.filter(cmd =>
+            cmd.runEvery && i !== 1 && i % cmd.runEvery !== 0 && i !== fm.maxIterations
+          );
+          const outputs = await runCommands(scheduledCommands, pi, fm.parallel);
+          for (const skipped of skippedCommands) {
+            outputs.push({ name: skipped.name, output: `[skipped: runs every ${skipped.runEvery} iterations]`, exitCode: 0 });
+          }
           let gitContext: { diff: string; log: string } | undefined;
           if (rawBody.includes("{{ git.diff") || rawBody.includes("{{ git.log")) {
             const isRepo = await isGitRepo(pi);
@@ -1109,18 +1313,34 @@ export default function (pi: ExtensionAPI) {
           };
           const regression = detectRegression([...loopState.iterationSummaries, tentativeSummary]);
           tentativeSummary.regressed = regression.regressed;
+          let objectiveEvaluation: ObjectiveEvaluation | undefined;
+          if (fm.objective) {
+            objectiveEvaluation = evaluateObjective([...loopState.iterationSummaries, tentativeSummary], fm.objective, fm.acceptanceRule);
+            tentativeSummary.objectiveValue = objectiveEvaluation.value;
+            tentativeSummary.objectiveAccepted = objectiveEvaluation.accepted;
+            tentativeSummary.objectiveReason = objectiveEvaluation.reason;
+          }
 
-          if (regression.regressed && snapshotCreated && loopState.rollbackOnRegression) {
+          const shouldRollback = snapshotCreated && loopState.rollbackOnRegression
+            && (regression.regressed || objectiveEvaluation?.accepted === false);
+          const rollbackReason = [
+            ...(regression.regressed ? regression.details : []),
+            ...(objectiveEvaluation?.accepted === false ? [objectiveEvaluation.reason] : []),
+          ].join("; ");
+
+          if (shouldRollback) {
             const rb = await rollbackToSnapshot(pi, i);
             if (rb.ok) {
               tentativeSummary.rolledBack = true;
-              tentativeSummary.rollbackDetails = regression.details.join("; ");
-              ctx.ui.notify(`Iteration ${i}: REGRESSION rolled back (${regression.details.join("; ")})`, "warning");
+              tentativeSummary.rollbackDetails = rollbackReason;
+              ctx.ui.notify(`Iteration ${i}: changes rolled back (${rollbackReason})`, "warning");
             } else {
-              ctx.ui.notify(`Iteration ${i}: rollback failed (${rb.output}); continuing with regressed state`, "warning");
+              ctx.ui.notify(`Iteration ${i}: rollback failed (${rb.output}); continuing with current state`, "warning");
             }
           } else if (regression.regressed) {
             ctx.ui.notify(`Iteration ${i}: REGRESSION detected (${regression.details.join("; ")})`, "warning");
+          } else if (objectiveEvaluation?.accepted === false) {
+            ctx.ui.notify(`Iteration ${i}: objective acceptance failed (${objectiveEvaluation.reason})`, "warning");
           }
 
           if (snapshotCreated && !tentativeSummary.rolledBack) {
@@ -1153,6 +1373,39 @@ export default function (pi: ExtensionAPI) {
             break;
           }
 
+          // Provider error detection: classify and apply recovery policy
+          const entriesForErrorCheck = ctx.sessionManager.getEntries();
+          let providerErrorKind: ProviderErrorKind | null = null;
+          for (let ei = entriesForErrorCheck.length - 1; ei >= iterationEntryStart; ei--) {
+            providerErrorKind = classifyProviderError(entriesForErrorCheck[ei]);
+            if (providerErrorKind) break;
+          }
+          if (providerErrorKind) {
+            const policy = PROVIDER_ERROR_POLICIES[providerErrorKind];
+            if (policy === "pause") {
+              ctx.ui.notify(`Iteration ${i}: provider error (${providerErrorKind}) — pausing loop. Resume with /ralph when ready.`, "warning");
+              break;
+            } else if (policy === "stop") {
+              ctx.ui.notify(`Iteration ${i}: provider error (${providerErrorKind}) — stopping loop.`, "error");
+              break;
+            } else if (policy === "retry") {
+              const retryKey = `provider_retry_${providerErrorKind}`;
+              const retryCount = (providerRetryCounts.get(retryKey) ?? 0) + 1;
+              providerRetryCounts.set(retryKey, retryCount);
+              if (retryCount > MAX_PROVIDER_RETRIES) {
+                ctx.ui.notify(`Iteration ${i}: provider error (${providerErrorKind}) persisted after ${MAX_PROVIDER_RETRIES} retries — stopping.`, "error");
+                break;
+              }
+              ctx.ui.notify(`Iteration ${i}: transient provider error (${providerErrorKind}), retrying after backoff (attempt ${retryCount}/${MAX_PROVIDER_RETRIES})…`, "warning");
+              await new Promise(r => setTimeout(r, RATE_LIMIT_BACKOFF_MS * retryCount));
+              loopState.iterationSummaries.pop();
+              i--;
+              continue;
+            }
+          } else {
+            providerRetryCounts.clear();
+          }
+
           const persistedAfter = readPersistedLoopState(ctx);
           if (persistedAfter?.active && persistedAfter.stopRequested) {
             loopState.stopRequested = true;
@@ -1162,7 +1415,8 @@ export default function (pi: ExtensionAPI) {
 
           if (fm.completionPromise) {
             const entries = ctx.sessionManager.getEntries();
-            for (const entry of entries) {
+            for (let ei = iterationEntryStart; ei < entries.length; ei++) {
+              const entry = entries[ei];
               if (entry.type === "message" && entry.message?.role === "assistant") {
                 const text = entry.message.content?.filter((b: any) => b.type === "text")?.map((b: any) => b.text)?.join("") ?? "";
                 const match = text.match(/<promise>([^<]+)<\/promise>/);
@@ -1212,6 +1466,29 @@ export default function (pi: ExtensionAPI) {
             )) {
               ctx.ui.notify(`Iteration ${i}: ${fm.greenStreakLimit} consecutive green iterations — consider the task complete or refine RALPH.md`, "warning");
               break iterationLoop;
+            }
+          }
+
+          // Convergence detection: no changes + metrics plateau over a window
+          if (i >= fm.minIterations) {
+            const convergence = detectConvergence(loopState.iterationSummaries, CONVERGENCE_WINDOW);
+            if (convergence.converged) {
+              ctx.ui.notify(`Iteration ${i}: converged — ${convergence.reason}`, "info");
+              break iterationLoop;
+            }
+          }
+
+          // Objective-met early stop: if objective is configured and current value is optimal, stop
+          if (fm.objective && i >= fm.minIterations && objectiveEvaluation?.accepted !== false) {
+            const meta = OBJECTIVE_META[fm.objective.metric];
+            const mode = fm.objective.mode ?? meta.defaultMode;
+            const currentVal = summary.signals[meta.signalKey];
+            if (typeof currentVal === "number") {
+              const isOptimal = mode === "minimize" ? currentVal === 0 : false;
+              if (isOptimal && commandSummaries.every(cs => cs.status === "ok")) {
+                ctx.ui.notify(`Iteration ${i}: objective "${fm.objective.metric}" reached optimal value (${currentVal}) — loop complete`, "info");
+                break iterationLoop;
+              }
             }
           }
 

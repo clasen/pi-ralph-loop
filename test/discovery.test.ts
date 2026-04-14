@@ -8,16 +8,22 @@ import { basename } from "node:path";
 
 // --- Inlined from src/index.ts (must stay in sync) ---
 
-type CommandDef = { name: string; run: string; timeout: number; maxOutput?: number; signalPatterns?: Record<string, string[]> };
+type CommandDef = { name: string; run: string; timeout: number; maxOutput?: number; signalPatterns?: Record<string, string[]>; runEvery?: number };
 type DoneCriterion = { name: string; command: string; pattern: string };
+type ObjectiveMetric = "test_failures" | "tests_passed" | "lint_errors" | "lint_warnings";
+type ObjectiveMode = "minimize" | "maximize";
+type ObjectiveDef = { metric: ObjectiveMetric; mode?: ObjectiveMode };
 type Frontmatter = {
   commands: CommandDef[];
   maxIterations: number;
+  minIterations: number;
   timeout: number;
   completionPromise?: string;
   rollbackOnRegression: boolean;
   guardrails: { blockCommands: string[]; protectedFiles: string[] };
   doneCriteria?: DoneCriterion[];
+  objective?: ObjectiveDef;
+  acceptanceRule: string;
   greenStreakLimit: number;
   parallel: boolean;
 };
@@ -58,7 +64,6 @@ function discoverProject(cwd: string): ProjectDiscovery | null {
       if (scripts.test && !seen.has(scripts.test)) {
         seen.add(scripts.test);
         commands.push({ name: "tests", run: "npm test", timeout: 120, maxOutput: 4000 });
-        doneCriteria.push({ name: "tests_green", command: "tests", pattern: "# fail 0|0 failed|0 failing" });
       }
       if (scripts.lint && !seen.has(scripts.lint)) {
         seen.add(scripts.lint);
@@ -66,17 +71,16 @@ function discoverProject(cwd: string): ProjectDiscovery | null {
       }
       if (scripts.benchmark && !seen.has(scripts.benchmark)) {
         seen.add(scripts.benchmark);
-        commands.push({ name: "benchmark", run: "npm run benchmark", timeout: 600, maxOutput: 6000 });
+        commands.push({ name: "benchmark", run: "npm run benchmark", timeout: 600, maxOutput: 6000, runEvery: 3 });
       } else if (scripts.bench && !seen.has(scripts.bench)) {
         seen.add(scripts.bench);
-        commands.push({ name: "benchmark", run: "npm run bench", timeout: 600, maxOutput: 6000 });
+        commands.push({ name: "benchmark", run: "npm run bench", timeout: 600, maxOutput: 6000, runEvery: 3 });
       }
     } catch { /* malformed package.json */ }
   } else if (has("Cargo.toml")) {
     ecosystem = "rust";
     commands.push({ name: "tests", run: "cargo test", timeout: 300, maxOutput: 4000 });
     commands.push({ name: "lint", run: "cargo clippy -- -D warnings", timeout: 120, maxOutput: 2000 });
-    doneCriteria.push({ name: "tests_green", command: "tests", pattern: "test result: ok" });
   } else if (has("pyproject.toml") || has("setup.py") || has("requirements.txt")) {
     ecosystem = "python";
     if (has("pyproject.toml")) {
@@ -93,7 +97,6 @@ function discoverProject(cwd: string): ProjectDiscovery | null {
     if (commands.length === 0) {
       commands.push({ name: "tests", run: "pytest", timeout: 300, maxOutput: 4000 });
     }
-    doneCriteria.push({ name: "tests_green", command: "tests", pattern: "passed|0 failed" });
   } else if (has("Makefile") || has("makefile")) {
     ecosystem = "make";
     commands.push({ name: "tests", run: "make test", timeout: 300, maxOutput: 4000 });
@@ -108,9 +111,15 @@ function discoverProject(cwd: string): ProjectDiscovery | null {
 function generateDefaultRalph(discovery: ProjectDiscovery): ParsedRalph {
   const { specFile, readmeFile, commands, doneCriteria } = discovery;
 
+  const hasTests = commands.some(c => c.name === "tests");
+  const autoObjective: ObjectiveDef | undefined = hasTests
+    ? { metric: "test_failures", mode: "minimize" }
+    : undefined;
+
   const frontmatter: Frontmatter = {
     commands,
     maxIterations: 25,
+    minIterations: 3,
     timeout: 300,
     rollbackOnRegression: true,
     guardrails: {
@@ -118,6 +127,8 @@ function generateDefaultRalph(discovery: ProjectDiscovery): ParsedRalph {
       protectedFiles: specFile ? [specFile] : [],
     },
     doneCriteria: doneCriteria.length ? doneCriteria : undefined,
+    objective: autoObjective,
+    acceptanceRule: "non_regression",
     greenStreakLimit: 10,
     parallel: commands.length > 1,
   };
@@ -198,7 +209,8 @@ describe("discoverProject", () => {
     assert.equal(result.commands[0].name, "tests");
     assert.equal(result.commands[1].name, "lint");
     assert.equal(result.commands[2].name, "benchmark");
-    assert.ok(result.doneCriteria.length > 0);
+    assert.equal(result.commands[2].runEvery, 3);
+    assert.equal(result.doneCriteria.length, 0);
   });
 
   it("deduplicates commands when lint === test", () => {
@@ -305,12 +317,14 @@ describe("generateDefaultRalph", () => {
     const result = generateDefaultRalph(discovery);
 
     assert.equal(result.frontmatter.maxIterations, 25);
+    assert.equal(result.frontmatter.minIterations, 3);
     assert.equal(result.frontmatter.rollbackOnRegression, true);
     assert.equal(result.frontmatter.greenStreakLimit, 10);
     assert.equal(result.frontmatter.parallel, true);
     assert.deepEqual(result.frontmatter.guardrails.protectedFiles, ["specs.md"]);
-    assert.ok(result.frontmatter.doneCriteria);
-    assert.equal(result.frontmatter.doneCriteria!.length, 1);
+    assert.ok(result.frontmatter.objective);
+    assert.equal(result.frontmatter.objective!.metric, "test_failures");
+    assert.equal(result.frontmatter.objective!.mode, "minimize");
   });
 
   it("includes spec reference in body", () => {
